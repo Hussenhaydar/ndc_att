@@ -1,9 +1,13 @@
 <?php
 require_once 'config.php';
 
-// إعادة توجيه إذا كان مسجل دخول
-if (isset($_SESSION['admin_id'])) {
-    redirect('admin_dashboard.php');
+// إعادة توجيه إذا كان مسجل دخول - مع فحص إضافي لمنع التكرار
+if (isset($_SESSION['admin_id']) && !isset($_GET['force_login'])) {
+    // فحص إضافي للتأكد من صحة الجلسة
+    if (!empty($_SESSION['admin_id']) && is_numeric($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php");
+        exit(); // استخدام exit بدلاً من redirect لتجنب المشاكل
+    }
 }
 
 $error = '';
@@ -53,37 +57,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 // فحص كلمة المرور
                 elseif (Security::verifyPassword($password, $admin['password'])) {
+                    
+                    // إعادة تشغيل الجلسة لضمان النظافة
+                    session_regenerate_id(true);
+                    
                     // تسجيل دخول ناجح
                     $_SESSION['admin_id'] = $admin['id'];
                     $_SESSION['admin_username'] = $admin['username'];
                     $_SESSION['admin_name'] = $admin['full_name'];
                     $_SESSION['admin_email'] = $admin['email'];
                     $_SESSION['login_time'] = time();
+                    $_SESSION['last_activity'] = time();
+                    $_SESSION['user_ip'] = Security::getClientIP();
+                    $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'] ?? '';
                     
                     // تحديث آخر تسجيل دخول
-                    $update_query = "UPDATE admins SET last_login = NOW() WHERE id = ?";
-                    $update_stmt = $db->prepare($update_query);
-                    $update_stmt->execute([$admin['id']]);
+                    try {
+                        $update_query = "UPDATE admins SET last_login = NOW() WHERE id = ?";
+                        $update_stmt = $db->prepare($update_query);
+                        $update_stmt->execute([$admin['id']]);
+                    } catch (Exception $e) {
+                        error_log("Failed to update last login: " . $e->getMessage());
+                    }
                     
                     // حفظ الجلسة للتذكر
                     if ($remember_me) {
-                        $token = Security::generateToken(64);
-                        $expires = date('Y-m-d H:i:s', strtotime('+30 days'));
-                        
-                        // حفظ token في قاعدة البيانات
-                        $session_query = "INSERT INTO user_sessions (user_type, user_id, session_token, ip_address, user_agent, expires_at) 
-                                         VALUES ('admin', ?, ?, ?, ?, ?)";
-                        $session_stmt = $db->prepare($session_query);
-                        $session_stmt->execute([
-                            $admin['id'], 
-                            $token, 
-                            Security::getClientIP(), 
-                            $_SERVER['HTTP_USER_AGENT'] ?? '', 
-                            $expires
-                        ]);
-                        
-                        // تعيين cookie
-                        setcookie('remember_admin', $token, strtotime('+30 days'), '/', '', true, true);
+                        try {
+                            $token = Security::generateToken(64);
+                            $expires = date('Y-m-d H:i:s', strtotime('+30 days'));
+                            
+                            // التحقق من وجود جدول user_sessions
+                            $check_table = $db->query("SHOW TABLES LIKE 'user_sessions'");
+                            if ($check_table->rowCount() > 0) {
+                                $session_query = "INSERT INTO user_sessions (user_type, user_id, session_token, ip_address, user_agent, expires_at) 
+                                                 VALUES ('admin', ?, ?, ?, ?, ?)";
+                                $session_stmt = $db->prepare($session_query);
+                                $session_stmt->execute([
+                                    $admin['id'], 
+                                    $token, 
+                                    Security::getClientIP(), 
+                                    $_SERVER['HTTP_USER_AGENT'] ?? '', 
+                                    $expires
+                                ]);
+                                
+                                setcookie('remember_admin', $token, strtotime('+30 days'), '/', '', isset($_SERVER['HTTPS']), true);
+                            }
+                        } catch (Exception $e) {
+                            error_log("Remember me functionality error: " . $e->getMessage());
+                        }
                     }
                     
                     // تسجيل النشاط
@@ -92,14 +113,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // إنشاء إشعار ترحيب
                     createNotification('admin', $admin['id'], 'مرحباً بك', 'تم تسجيل دخولك بنجاح', 'success');
                     
-                    $success = 'تم تسجيل الدخول بنجاح. جاري التحويل...';
-                    
-                    // التحويل بعد ثانيتين
-                    echo "<script>
-                        setTimeout(function() {
-                            window.location.href = 'admin_dashboard.php';
-                        }, 2000);
-                    </script>";
+                    // التحويل المباشر بدون JavaScript
+                    header("Location: admin_dashboard.php");
+                    exit();
                     
                 } else {
                     $error = 'كلمة المرور غير صحيحة';
@@ -110,6 +126,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Security::logFailedLogin($username);
             }
             
+        } catch (PDOException $e) {
+            error_log("Database error in admin login: " . $e->getMessage());
+            $error = 'حدث خطأ في الاتصال بقاعدة البيانات. يرجى التأكد من الإعدادات.';
         } catch (Exception $e) {
             error_log("Admin login error: " . $e->getMessage());
             $error = 'حدث خطأ في النظام. يرجى المحاولة لاحقاً.';
@@ -117,40 +136,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// فحص cookie التذكر
-if (!isset($_SESSION['admin_id']) && isset($_COOKIE['remember_admin'])) {
+// فحص cookie التذكر - مع فحص إضافي لمنع التكرار
+if (!isset($_SESSION['admin_id']) && isset($_COOKIE['remember_admin']) && !isset($_GET['no_auto_login'])) {
     try {
         $token = $_COOKIE['remember_admin'];
         $db = Database::getInstance()->getConnection();
         
-        $query = "SELECT s.*, a.id, a.username, a.full_name, a.email, a.is_active 
-                  FROM user_sessions s 
-                  JOIN admins a ON s.user_id = a.id 
-                  WHERE s.session_token = ? AND s.user_type = 'admin' 
-                  AND s.is_active = 1 AND s.expires_at > NOW()";
-        $stmt = $db->prepare($query);
-        $stmt->execute([$token]);
-        
-        if ($stmt->rowCount() > 0) {
-            $session_data = $stmt->fetch(PDO::FETCH_ASSOC);
+        $check_table = $db->query("SHOW TABLES LIKE 'user_sessions'");
+        if ($check_table->rowCount() > 0) {
+            $query = "SELECT s.*, a.id, a.username, a.full_name, a.email, a.is_active 
+                      FROM user_sessions s 
+                      JOIN admins a ON s.user_id = a.id 
+                      WHERE s.session_token = ? AND s.user_type = 'admin' 
+                      AND s.is_active = 1 AND s.expires_at > NOW()";
+            $stmt = $db->prepare($query);
+            $stmt->execute([$token]);
             
-            if ($session_data['is_active']) {
-                // استعادة الجلسة
-                $_SESSION['admin_id'] = $session_data['id'];
-                $_SESSION['admin_username'] = $session_data['username'];
-                $_SESSION['admin_name'] = $session_data['full_name'];
-                $_SESSION['admin_email'] = $session_data['email'];
-                $_SESSION['login_time'] = time();
+            if ($stmt->rowCount() > 0) {
+                $session_data = $stmt->fetch(PDO::FETCH_ASSOC);
                 
-                logActivity('admin', $session_data['id'], 'auto_login', 'تسجيل دخول تلقائي من cookie');
-                redirect('admin_dashboard.php');
+                if ($session_data['is_active']) {
+                    // استعادة الجلسة
+                    session_regenerate_id(true);
+                    $_SESSION['admin_id'] = $session_data['id'];
+                    $_SESSION['admin_username'] = $session_data['username'];
+                    $_SESSION['admin_name'] = $session_data['full_name'];
+                    $_SESSION['admin_email'] = $session_data['email'];
+                    $_SESSION['login_time'] = time();
+                    $_SESSION['last_activity'] = time();
+                    $_SESSION['user_ip'] = Security::getClientIP();
+                    $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'] ?? '';
+                    
+                    logActivity('admin', $session_data['id'], 'auto_login', 'تسجيل دخول تلقائي من cookie');
+                    header("Location: admin_dashboard.php");
+                    exit();
+                }
+            } else {
+                // حذف cookie إذا كان غير صالح
+                setcookie('remember_admin', '', time() - 3600, '/');
             }
-        } else {
-            // حذف cookie إذا كان غير صالح
-            setcookie('remember_admin', '', time() - 3600, '/');
         }
     } catch (Exception $e) {
         error_log("Remember me error: " . $e->getMessage());
+        setcookie('remember_admin', '', time() - 3600, '/');
     }
 }
 
@@ -183,24 +211,6 @@ $app_name = getSetting('company_name', APP_NAME);
             position: relative;
         }
         
-        /* خلفية متحركة */
-        .animated-bg {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: -1;
-            background: linear-gradient(45deg, transparent 30%, rgba(255,255,255,0.1) 50%, transparent 70%);
-            background-size: 200% 200%;
-            animation: shimmer 4s ease-in-out infinite;
-        }
-        
-        @keyframes shimmer {
-            0%, 100% { background-position: 0% 0%; }
-            50% { background-position: 100% 100%; }
-        }
-        
         .login-container {
             background: rgba(255, 255, 255, 0.95);
             backdrop-filter: blur(20px);
@@ -212,17 +222,6 @@ $app_name = getSetting('company_name', APP_NAME);
             text-align: center;
             position: relative;
             border: 1px solid rgba(255,255,255,0.3);
-        }
-        
-        .login-container::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
-            background: linear-gradient(90deg, #667eea, #764ba2);
-            border-radius: 25px 25px 0 0;
         }
         
         .logo {
@@ -237,12 +236,6 @@ $app_name = getSetting('company_name', APP_NAME);
             color: white;
             font-size: 36px;
             box-shadow: 0 15px 35px rgba(102,126,234,0.3);
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.05); }
         }
         
         h1 {
@@ -264,12 +257,6 @@ $app_name = getSetting('company_name', APP_NAME);
             border-radius: 12px;
             margin-bottom: 25px;
             font-weight: 500;
-            animation: slideIn 0.5s ease;
-        }
-        
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateY(-20px); }
-            to { opacity: 1; transform: translateY(0); }
         }
         
         .alert.success {
@@ -303,14 +290,10 @@ $app_name = getSetting('company_name', APP_NAME);
             font-size: 16px;
         }
         
-        .input-wrapper {
-            position: relative;
-        }
-        
         input[type="text"],
         input[type="password"] {
             width: 100%;
-            padding: 18px 50px 18px 20px;
+            padding: 18px 20px;
             border: 2px solid #e1e5e9;
             border-radius: 15px;
             font-size: 16px;
@@ -319,44 +302,11 @@ $app_name = getSetting('company_name', APP_NAME);
             color: #2c3e50;
         }
         
-        input[type="text"]:focus,
-        input[type="password"]:focus {
+        input:focus {
             outline: none;
             border-color: #667eea;
             background: white;
-            transform: translateY(-2px);
             box-shadow: 0 8px 25px rgba(102,126,234,0.15);
-        }
-        
-        .input-icon {
-            position: absolute;
-            right: 15px;
-            top: 50%;
-            transform: translateY(-50%);
-            color: #7f8c8d;
-            font-size: 18px;
-            transition: color 0.3s ease;
-        }
-        
-        input:focus + .input-icon {
-            color: #667eea;
-        }
-        
-        .password-toggle {
-            position: absolute;
-            left: 15px;
-            top: 50%;
-            transform: translateY(-50%);
-            background: none;
-            border: none;
-            color: #7f8c8d;
-            cursor: pointer;
-            font-size: 18px;
-            transition: color 0.3s ease;
-        }
-        
-        .password-toggle:hover {
-            color: #667eea;
         }
         
         .remember-me {
@@ -365,19 +315,6 @@ $app_name = getSetting('company_name', APP_NAME);
             justify-content: flex-start;
             margin-bottom: 30px;
             gap: 10px;
-        }
-        
-        .remember-me input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            accent-color: #667eea;
-        }
-        
-        .remember-me label {
-            margin: 0;
-            font-size: 14px;
-            color: #6c757d;
-            cursor: pointer;
         }
         
         .login-btn {
@@ -391,60 +328,11 @@ $app_name = getSetting('company_name', APP_NAME);
             font-weight: 600;
             cursor: pointer;
             transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .login-btn::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-            transition: left 0.5s ease;
-        }
-        
-        .login-btn:hover::before {
-            left: 100%;
         }
         
         .login-btn:hover {
             transform: translateY(-3px);
             box-shadow: 0 15px 35px rgba(102,126,234,0.4);
-        }
-        
-        .login-btn:active {
-            transform: translateY(-1px);
-        }
-        
-        .login-btn:disabled {
-            background: #bdc3c7;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        .login-btn.loading {
-            pointer-events: none;
-        }
-        
-        .login-btn.loading::after {
-            content: '';
-            position: absolute;
-            right: 20px;
-            top: 50%;
-            transform: translateY(-50%);
-            width: 20px;
-            height: 20px;
-            border: 2px solid rgba(255,255,255,0.3);
-            border-radius: 50%;
-            border-top-color: white;
-            animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-            to { transform: translateY(-50%) rotate(360deg); }
         }
         
         .back-link {
@@ -457,118 +345,42 @@ $app_name = getSetting('company_name', APP_NAME);
             color: #667eea;
             text-decoration: none;
             font-weight: 500;
-            transition: color 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
         }
         
-        .back-link a:hover {
-            color: #764ba2;
+        /* إضافة زر التجربة */
+        .test-credentials {
+            background: #e3f2fd;
+            border: 1px solid #2196f3;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            text-align: center;
         }
         
-        .security-info {
-            background: linear-gradient(135deg, #e8f4fd, #d1ecf1);
-            border: 1px solid #bee5eb;
-            border-radius: 12px;
-            padding: 20px;
-            margin-top: 30px;
-            text-align: right;
-        }
-        
-        .security-info h4 {
-            color: #0c5460;
-            margin-bottom: 10px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .security-info p {
-            color: #055160;
+        .test-btn {
+            background: #2196f3;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
             font-size: 14px;
-            line-height: 1.5;
-            margin: 0;
-        }
-        
-        /* تحسينات للهواتف */
-        @media (max-width: 768px) {
-            body {
-                padding: 15px;
-            }
-            
-            .login-container {
-                padding: 40px 30px;
-                border-radius: 20px;
-            }
-            
-            .logo {
-                width: 70px;
-                height: 70px;
-                font-size: 28px;
-                border-radius: 18px;
-            }
-            
-            h1 {
-                font-size: 26px;
-            }
-            
-            input[type="text"],
-            input[type="password"] {
-                padding: 16px 45px 16px 18px;
-                font-size: 16px; /* منع التكبير في iOS */
-            }
-            
-            .login-btn {
-                padding: 16px;
-                font-size: 17px;
-            }
-        }
-        
-        @media (max-width: 480px) {
-            .login-container {
-                padding: 30px 25px;
-            }
-            
-            .logo {
-                width: 60px;
-                height: 60px;
-                font-size: 24px;
-            }
-            
-            h1 {
-                font-size: 22px;
-            }
-        }
-        
-        /* منع التكبير في iOS */
-        input[type="text"],
-        input[type="password"] {
-            -webkit-appearance: none;
-            appearance: none;
-        }
-        
-        /* تحسين إمكانية الوصول */
-        .sr-only {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            padding: 0;
-            margin: -1px;
-            overflow: hidden;
-            clip: rect(0, 0, 0, 0);
-            white-space: nowrap;
-            border: 0;
+            margin-top: 10px;
         }
     </style>
 </head>
 <body>
-    <div class="animated-bg"></div>
-    
     <div class="login-container">
         <div class="logo">🔒</div>
         <h1>لوحة الإدارة</h1>
         <p class="subtitle">نظام إدارة بصمة الوجه<br>تسجيل دخول آمن للإدارة</p>
+        
+        <!-- بيانات التجربة -->
+        <div class="test-credentials">
+            <strong>🔧 بيانات تجريبية:</strong><br>
+            المستخدم: admin | كلمة المرور: admin123
+            <button type="button" class="test-btn" onclick="fillTestData()">ملء تلقائي</button>
+        </div>
         
         <?php if ($success): ?>
             <div class="alert success">
@@ -593,24 +405,15 @@ $app_name = getSetting('company_name', APP_NAME);
             
             <div class="form-group">
                 <label for="username">اسم المستخدم</label>
-                <div class="input-wrapper">
-                    <input type="text" id="username" name="username" required 
-                           autocomplete="username" spellcheck="false"
-                           value="<?php echo isset($_POST['username']) ? htmlspecialchars($_POST['username']) : ''; ?>">
-                    <span class="input-icon">👤</span>
-                </div>
+                <input type="text" id="username" name="username" required 
+                       autocomplete="username" spellcheck="false"
+                       value="<?php echo isset($_POST['username']) ? htmlspecialchars($_POST['username']) : ''; ?>">
             </div>
             
             <div class="form-group">
                 <label for="password">كلمة المرور</label>
-                <div class="input-wrapper">
-                    <input type="password" id="password" name="password" required 
-                           autocomplete="current-password">
-                    <span class="input-icon">🔐</span>
-                    <button type="button" class="password-toggle" id="togglePassword" aria-label="إظهار/إخفاء كلمة المرور">
-                        👁️
-                    </button>
-                </div>
+                <input type="password" id="password" name="password" required 
+                       autocomplete="current-password">
             </div>
             
             <div class="remember-me">
@@ -623,161 +426,23 @@ $app_name = getSetting('company_name', APP_NAME);
             </button>
         </form>
         
-        <div class="security-info">
-            <h4>🔒 معلومات الأمان</h4>
-            <p>
-                يتم تسجيل جميع محاولات تسجيل الدخول. استخدم بيانات اعتماد صحيحة فقط.
-                في حالة نسيان كلمة المرور، يرجى مراجعة مدير النظام.
-            </p>
-        </div>
-        
         <div class="back-link">
-            <a href="index.php">
-                ← العودة إلى الصفحة الرئيسية
-            </a>
+            <a href="index.php">← العودة إلى الصفحة الرئيسية</a>
         </div>
     </div>
 
     <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const form = document.getElementById('loginForm');
-            const loginBtn = document.getElementById('loginBtn');
-            const togglePassword = document.getElementById('togglePassword');
-            const passwordInput = document.getElementById('password');
-            const usernameInput = document.getElementById('username');
-            
-            // إظهار/إخفاء كلمة المرور
-            togglePassword.addEventListener('click', function() {
-                const type = passwordInput.getAttribute('type') === 'password' ? 'text' : 'password';
-                passwordInput.setAttribute('type', type);
-                this.textContent = type === 'password' ? '👁️' : '🙈';
-            });
-            
-            // معالجة إرسال النموذج
-            form.addEventListener('submit', function(e) {
-                const username = usernameInput.value.trim();
-                const password = passwordInput.value;
-                
-                if (!username || !password) {
-                    e.preventDefault();
-                    showAlert('يرجى إدخال جميع البيانات المطلوبة', 'error');
-                    return;
-                }
-                
-                if (username.length < 3) {
-                    e.preventDefault();
-                    showAlert('اسم المستخدم قصير جداً', 'error');
-                    usernameInput.focus();
-                    return;
-                }
-                
-                if (password.length < 4) {
-                    e.preventDefault();
-                    showAlert('كلمة المرور قصيرة جداً', 'error');
-                    passwordInput.focus();
-                    return;
-                }
-                
-                // إظهار حالة التحميل
-                loginBtn.classList.add('loading');
-                loginBtn.disabled = true;
-                loginBtn.innerHTML = 'جاري التحقق... <span class="sr-only">يرجى الانتظار</span>';
-            });
-            
-            // التركيز التلقائي
-            if (usernameInput.value) {
-                passwordInput.focus();
-            } else {
-                usernameInput.focus();
-            }
-            
-            // منع إرسال النموذج عدة مرات
-            let isSubmitting = false;
-            form.addEventListener('submit', function(e) {
-                if (isSubmitting) {
-                    e.preventDefault();
-                    return;
-                }
-                isSubmitting = true;
-            });
-            
-            // تنظيف حالة التحميل عند حدوث خطأ
-            window.addEventListener('pageshow', function() {
-                loginBtn.classList.remove('loading');
-                loginBtn.disabled = false;
-                loginBtn.innerHTML = '🔐 تسجيل الدخول';
-                isSubmitting = false;
-            });
-            
-            // منع التكبير في iOS
-            if (/iPad|iPhone|iPod/.test(navigator.userAgent)) {
-                const viewport = document.querySelector('meta[name=viewport]');
-                viewport.setAttribute('content', 
-                    'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');
-            }
-            
-            // تحسين تجربة المستخدم - تذكير بـ Caps Lock
-            passwordInput.addEventListener('keydown', function(e) {
-                if (e.getModifierState && e.getModifierState('CapsLock')) {
-                    showAlert('تحذير: Caps Lock مفعل', 'warning', 3000);
-                }
-            });
-            
-            // إضافة تأثيرات بصرية للتفاعل
-            const inputs = document.querySelectorAll('input[type="text"], input[type="password"]');
-            inputs.forEach(input => {
-                input.addEventListener('focus', function() {
-                    this.parentElement.style.transform = 'scale(1.02)';
-                });
-                
-                input.addEventListener('blur', function() {
-                    this.parentElement.style.transform = 'scale(1)';
-                });
-            });
+        function fillTestData() {
+            document.getElementById('username').value = 'admin';
+            document.getElementById('password').value = 'admin123';
+        }
+        
+        // منع إرسال النموذج عدة مرات
+        document.getElementById('loginForm').addEventListener('submit', function() {
+            const btn = document.getElementById('loginBtn');
+            btn.disabled = true;
+            btn.textContent = 'جاري تسجيل الدخول...';
         });
-        
-        // وظيفة إظهار التنبيهات
-        function showAlert(message, type = 'info', duration = 5000) {
-            // إزالة التنبيهات السابقة
-            const existingAlerts = document.querySelectorAll('.alert.dynamic');
-            existingAlerts.forEach(alert => alert.remove());
-            
-            const alert = document.createElement('div');
-            alert.className = `alert ${type} dynamic`;
-            alert.innerHTML = `<strong>${getAlertIcon(type)}</strong> ${message}`;
-            
-            const form = document.getElementById('loginForm');
-            form.parentNode.insertBefore(alert, form);
-            
-            if (duration > 0) {
-                setTimeout(() => {
-                    alert.remove();
-                }, duration);
-            }
-        }
-        
-        function getAlertIcon(type) {
-            const icons = {
-                'success': '✅ نجح!',
-                'error': '❌ خطأ!',
-                'warning': '⚠️ تحذير!',
-                'info': 'ℹ️ معلومة!'
-            };
-            return icons[type] || icons.info;
-        }
-        
-        // معالجة الأخطاء العامة
-        window.addEventListener('error', function(e) {
-            console.error('خطأ في الصفحة:', e.error);
-        });
-        
-        // تتبع محاولات تسجيل الدخول للإحصائيات
-        if (typeof gtag !== 'undefined') {
-            gtag('event', 'admin_login_page_view', {
-                'event_category': 'Authentication',
-                'event_label': 'Admin Login Page'
-            });
-        }
     </script>
 </body>
 </html>

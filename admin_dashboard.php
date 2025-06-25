@@ -1,6 +1,6 @@
 <?php
 require_once 'config.php';
-
+checkAdminLogin();
 
 $database = Database::getInstance();
 $db = $database->getConnection();
@@ -9,6 +9,17 @@ $db = $database->getConnection();
 $today = date('Y-m-d');
 $current_month = date('Y-m');
 $current_year = date('Y');
+
+// تهيئة المتغيرات
+$emp_stats = [];
+$att_today = [];
+$leave_stats = [];
+$monthly_stats = [];
+$recent_records = [];
+$activities = [];
+$pending_leave_requests = [];
+$dept_stats = [];
+$unread_notifications = [];
 
 try {
     // إحصائيات الموظفين
@@ -21,7 +32,12 @@ try {
          FROM employees"
     );
     $employees_stats->execute();
-    $emp_stats = $employees_stats->fetch(PDO::FETCH_ASSOC);
+    $emp_stats = $employees_stats->fetch(PDO::FETCH_ASSOC) ?: [
+        'total_employees' => 0,
+        'active_employees' => 0,
+        'inactive_employees' => 0,
+        'active_last_week' => 0
+    ];
 
     // إحصائيات الحضور اليوم
     $attendance_today = $db->prepare(
@@ -34,7 +50,12 @@ try {
          WHERE a.attendance_date = ?"
     );
     $attendance_today->execute([$today]);
-    $att_today = $attendance_today->fetch(PDO::FETCH_ASSOC);
+    $att_today = $attendance_today->fetch(PDO::FETCH_ASSOC) ?: [
+        'present_today' => 0,
+        'late_today' => 0,
+        'still_working' => 0,
+        'avg_work_hours_today' => 0
+    ];
 
     // إحصائيات الإجازات
     $leaves_stats = $db->prepare(
@@ -47,7 +68,12 @@ try {
          WHERE YEAR(created_at) = ?"
     );
     $leaves_stats->execute([$current_year]);
-    $leave_stats = $leaves_stats->fetch(PDO::FETCH_ASSOC);
+    $leave_stats = $leaves_stats->fetch(PDO::FETCH_ASSOC) ?: [
+        'total_requests' => 0,
+        'pending_requests' => 0,
+        'approved_requests' => 0,
+        'days_this_month' => 0
+    ];
 
     // إحصائيات الحضور الشهرية
     $monthly_attendance = $db->prepare(
@@ -62,7 +88,14 @@ try {
          WHERE DATE_FORMAT(a.attendance_date, '%Y-%m') = ?"
     );
     $monthly_attendance->execute([$current_month]);
-    $monthly_stats = $monthly_attendance->fetch(PDO::FETCH_ASSOC);
+    $monthly_stats = $monthly_attendance->fetch(PDO::FETCH_ASSOC) ?: [
+        'unique_employees' => 0,
+        'total_records' => 0,
+        'present_days' => 0,
+        'late_days' => 0,
+        'avg_monthly_hours' => 0,
+        'total_work_hours' => 0
+    ];
 
     // حضور اليوم - آخر 10 سجلات
     $recent_attendance = $db->prepare(
@@ -75,11 +108,16 @@ try {
          LIMIT 10"
     );
     $recent_attendance->execute([$today]);
-    $recent_records = $recent_attendance->fetchAll(PDO::FETCH_ASSOC);
+    $recent_records = $recent_attendance->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
     // آخر الأنشطة
     $activity_log = $db->prepare(
-        "SELECT al.*, e.full_name as employee_name, a.full_name as admin_name
+        "SELECT al.*, 
+                CASE 
+                    WHEN al.user_type = 'employee' THEN e.full_name 
+                    WHEN al.user_type = 'admin' THEN a.full_name 
+                    ELSE 'النظام' 
+                END as user_name
          FROM activity_log al 
          LEFT JOIN employees e ON al.user_id = e.id AND al.user_type = 'employee'
          LEFT JOIN admins a ON al.user_id = a.id AND al.user_type = 'admin'
@@ -87,12 +125,12 @@ try {
          LIMIT 15"
     );
     $activity_log->execute();
-    $activities = $activity_log->fetchAll(PDO::FETCH_ASSOC);
+    $activities = $activity_log->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
     // الإجازات المعلقة
     $pending_leaves = $db->prepare(
         "SELECT l.*, e.full_name, e.employee_id, e.department, 
-                lt.type_name_ar as leave_type_name
+                COALESCE(lt.type_name_ar, 'غير محدد') as leave_type_name
          FROM leaves l
          JOIN employees e ON l.employee_id = e.id
          LEFT JOIN leave_types lt ON l.leave_type_id = lt.id
@@ -101,7 +139,7 @@ try {
          LIMIT 5"
     );
     $pending_leaves->execute();
-    $pending_leave_requests = $pending_leaves->fetchAll(PDO::FETCH_ASSOC);
+    $pending_leave_requests = $pending_leaves->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
     // إحصائيات الأقسام
     $department_stats = $db->prepare(
@@ -117,16 +155,14 @@ try {
          ORDER BY total_employees DESC"
     );
     $department_stats->execute([$today, $today]);
-    $dept_stats = $department_stats->fetchAll(PDO::FETCH_ASSOC);
+    $dept_stats = $department_stats->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
     // إشعارات لم تُقرأ
-    $unread_notifications = getUnreadNotifications('admin', $_SESSION['admin_id']);
+    $unread_notifications = getUnreadNotifications('admin', $_SESSION['admin_id']) ?: [];
 
 } catch (Exception $e) {
     error_log("Dashboard error: " . $e->getMessage());
-    $emp_stats = $att_today = $leave_stats = $monthly_stats = [];
-    $recent_records = $activities = $pending_leave_requests = $dept_stats = [];
-    $unread_notifications = [];
+    // في حالة الخطأ، نستمر بالقيم الافتراضية
 }
 
 $app_name = getSetting('company_name', APP_NAME);
@@ -284,6 +320,7 @@ $app_name = getSetting('company_name', APP_NAME);
             font-weight: 600;
             font-size: 14px;
             transition: all 0.3s ease;
+            text-decoration: none;
         }
         
         .logout-btn:hover {
@@ -835,7 +872,7 @@ $app_name = getSetting('company_name', APP_NAME);
                 <div class="user-info">
                     <div class="user-avatar">👤</div>
                     <div class="user-details">
-                        <div class="user-name"><?php echo htmlspecialchars($_SESSION['admin_name']); ?></div>
+                        <div class="user-name"><?php echo htmlspecialchars($_SESSION['admin_name'] ?? 'مدير النظام'); ?></div>
                         <div class="user-role">مدير النظام</div>
                     </div>
                 </div>
@@ -859,7 +896,7 @@ $app_name = getSetting('company_name', APP_NAME);
                 </li>
                 <li class="nav-item">
                     <a href="leaves.php">🏖️ الإجازات
-                        <?php if ($leave_stats['pending_requests'] > 0): ?>
+                        <?php if (($leave_stats['pending_requests'] ?? 0) > 0): ?>
                             <span class="badge"><?php echo $leave_stats['pending_requests']; ?></span>
                         <?php endif; ?>
                     </a>
@@ -879,7 +916,7 @@ $app_name = getSetting('company_name', APP_NAME);
         <div class="welcome-message">
             <div class="welcome-content">
                 <div class="welcome-title">
-                    مرحباً بك، <?php echo htmlspecialchars($_SESSION['admin_name']); ?>
+                    مرحباً بك، <?php echo htmlspecialchars($_SESSION['admin_name'] ?? 'مدير النظام'); ?>
                 </div>
                 <div class="welcome-subtitle">
                     <?php echo formatArabicDate($today); ?> - لوحة تحكم شاملة لإدارة نظام الحضور والانصراف
@@ -1067,18 +1104,15 @@ $app_name = getSetting('company_name', APP_NAME);
                                         'add_employee' => '👤',
                                         'update_employee' => '✏️',
                                         'approve_leave' => '✅',
-                                        'reject_leave' => '❌'
+                                        'reject_leave' => '❌',
+                                        'failed_login' => '❌'
                                     ];
                                     echo $icons[$activity['action']] ?? '📝';
                                     ?>
                                 </div>
                                 <div class="activity-content">
                                     <div class="activity-title">
-                                        <?php 
-                                        $user_name = $activity['user_type'] == 'employee' ? 
-                                            $activity['employee_name'] : $activity['admin_name'];
-                                        echo htmlspecialchars($user_name ?: 'مستخدم محذوف'); 
-                                        ?>
+                                        <?php echo htmlspecialchars($activity['user_name'] ?: 'مستخدم محذوف'); ?>
                                     </div>
                                     <div class="activity-description">
                                         <?php echo htmlspecialchars($activity['description']); ?>
@@ -1191,8 +1225,19 @@ $app_name = getSetting('company_name', APP_NAME);
                 second: '2-digit'
             };
             
-            const timeString = now.toLocaleString('ar-SA', options);
-            document.getElementById('currentTime').textContent = timeString;
+            try {
+                const timeString = now.toLocaleString('ar-SA', options);
+                const timeElement = document.getElementById('currentTime');
+                if (timeElement) {
+                    timeElement.textContent = timeString;
+                }
+            } catch (e) {
+                // fallback للمتصفحات التي لا تدعم ar-SA
+                const timeElement = document.getElementById('currentTime');
+                if (timeElement) {
+                    timeElement.textContent = now.toLocaleString();
+                }
+            }
         }
         
         // تحديث الوقت كل ثانية
@@ -1208,6 +1253,7 @@ $app_name = getSetting('company_name', APP_NAME);
             setTimeout(() => {
                 sections.forEach(section => section.classList.remove('loading'));
                 console.log('تم تحديث البيانات');
+                // يمكن إضافة استدعاء AJAX هنا لتحديث البيانات فعلياً
             }, 2000);
         }
         
@@ -1236,15 +1282,15 @@ $app_name = getSetting('company_name', APP_NAME);
             });
         }, observerOptions);
         
-        document.querySelectorAll('.section').forEach(section => {
-            section.style.opacity = '0';
-            section.style.transform = 'translateY(20px)';
-            section.style.transition = 'all 0.6s ease';
-            observer.observe(section);
-        });
-        
-        // تحسين تجربة المستخدم
         document.addEventListener('DOMContentLoaded', function() {
+            // إضافة تأثيرات التحميل
+            document.querySelectorAll('.section').forEach(section => {
+                section.style.opacity = '0';
+                section.style.transform = 'translateY(20px)';
+                section.style.transition = 'all 0.6s ease';
+                observer.observe(section);
+            });
+            
             // إضافة تأثيرات التحميل
             setTimeout(() => {
                 document.body.classList.add('loaded');
