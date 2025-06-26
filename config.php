@@ -632,12 +632,28 @@ class FileManager {
  * وظائف عامة للنظام - محسّنة ومطورة
  */
 
-function redirect($url) {
+function redirect($url, $force = false) {
+    // منع redirect loop
+    $current_url = $_SERVER['REQUEST_URI'] ?? '';
+    $target_url = parse_url($url, PHP_URL_PATH);
+    
+    if (!$force && $current_url === $target_url) {
+        return; // منع redirect للصفحة نفسها
+    }
+    
+    // تنظيف output buffer
+    if (ob_get_level()) {
+        ob_end_clean();
+    }
+    
+    // تعيين header
     if (!headers_sent()) {
-        header("Location: " . $url);
+        header("Location: " . $url, true, 302);
         exit();
     } else {
-        echo "<script>window.location.href='$url';</script>";
+        // استخدام JavaScript كـ fallback
+        echo "<script>window.location.replace('" . addslashes($url) . "');</script>";
+        echo "<noscript><meta http-equiv='refresh' content='0;url=" . htmlspecialchars($url) . "'></noscript>";
         exit();
     }
 }

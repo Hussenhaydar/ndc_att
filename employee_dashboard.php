@@ -1,6 +1,6 @@
 <?php
 require_once 'config.php';
-checkEmployeeLogin();
+
 
 $database = Database::getInstance();
 $db = $database->getConnection();
@@ -557,7 +557,7 @@ $app_name = getSetting('company_name', APP_NAME);
         function updateCurrentTime() {
             const now = new Date();
             const options = {
-                timeZone: 'Asia/Riyadh',
+                timeZone: 'Asia/Baghdad',
                 hour12: true,
                 weekday: 'long',
                 year: 'numeric',
@@ -568,7 +568,7 @@ $app_name = getSetting('company_name', APP_NAME);
                 second: '2-digit'
             };
             
-            const timeString = now.toLocaleString('ar-SA', options);
+            const timeString = now.toLocaleString('ar-IQ', options);
             document.getElementById('currentTime').textContent = timeString;
         }
         
